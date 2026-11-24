@@ -9,19 +9,36 @@
   约束 0 <= x_{N,O} <= t_{N,O}，且对每个旧区 Σ_N x_{N,O} = c_O。
 - 调一份新区 N 的档案，即得知该新区所有边上的 x_{N,O}，费用 f_N（每期最多 18 个新区）。
 
-唯一性
-------
-底账相容时，只要每个旧区至多剩一条「未查」边，全部未知量即被唯一确定
-（0 条未查边则剩余量必须为 0；1 条则其值等于旧区完工余数）。
-因此，同一旧区下不允许同时存在两个未查新区——这些新区两两构成「冲突」，
-待查集合必须覆盖冲突图的所有边，即冲突图的顶点覆盖；目标是费用最小的顶点覆盖。
-新区数 <= 18，直接枚举全部 2^18 个子集即可精确求解。
+唯一性（关键修正）
+------------------
+设旧区 O 的完工余数 r_O = c_O - 已查总数，未查边集合 E'，未查楼栋总数
+T' = Σ_{N∈E'} t_{N,O}。相容前提下 0 <= r_O <= T'：
+
+- r_O = 0：每条未查边都被唯一压成 0；
+- r_O = T'：每条未查边都被唯一顶到容量 t_{N,O}；
+- |E'| <= 1：0 条边时余数必为 0；1 条边时其值就是 r_O；
+- 其余情形（|E'| >= 2 且 0 < r_O < T'，下称「内部旧区」）：每条边至少可取
+  两个不同值，存在多组与底账相容的分配，整体无法唯一确定。
+
+调档后某旧区仍唯一确定的充要条件：调档后它不是内部旧区。对内部旧区，调走
+任一非空边子集后仍可能留下内部余数（可行余数构成整数区间
+[max(0, r-T_调), min(T_未查, r)]，区间内每个整数都可达），故必须把它的未查
+新区调到至多一个——这些新区两两构成「冲突」。边界旧区（r=0 或 r=T'）在任何
+相容查回结果下仍为边界，不产生冲突。因此待查集合 = 当前内部旧区冲突图的
+**最小费用顶点覆盖**（补集为最大权独立集），照单调档后任何相容查回结果都能
+唯一确定全部未知量。
+
+tie-break（同费用名单）：先选档案少（顶点覆盖小，即独立集大）的，再选按新区
+编码排序后字典序最靠前的名单（即独立集字典序最大）。
 
 可行性
 ------
 登记后对每个旧区独立判断：
     0 <= 余数 r_O = c_O - Σ已查 x <= Σ未查边 t
 （再结合各边 0 <= x <= t，整数边容量分配必然可凑足）。
+
+求解只在新区集合（k <= 18）上做 O(2^k) 位掩码 DP，不逐栋枚举，也不遍历任何
+可能的查回数。
 """
 from __future__ import annotations
 
@@ -333,85 +350,102 @@ def _check_feasible(
 
 # ---------------------------------------------------------------- 计划与核算
 
-def _conflict_masks(data: PeriodData, registered: dict[str, dict[str, int]]) -> list[int]:
-    """冲突图：共享同一旧区的未查新区两两冲突。返回每个新区的冲突邻接掩码。"""
+def _interior_conflict_adj(
+    data: PeriodData,
+    state: dict[str, dict[str, object]],
+    registered: dict[str, dict[str, int]],
+) -> list[int]:
+    """冲突图（位掩码邻接表，位序与 data.new_codes 一致）。
+
+    只有「内部旧区」（未查边 >= 2 且 0 < 完工余数 < 未查楼栋总数）下的未查
+    新区两两冲突；边界旧区（余数为 0 或等于未查容量）的边已被唯一压定，不
+    产生冲突，调它们只会白花档案费。
+    """
     n = len(data.new_codes)
-    masks = [0] * n
     index = {code: i for i, code in enumerate(data.new_codes)}
+    adj = [0] * n
     for old in data.old_codes:
-        members = [index[ncode] for ncode, _ in data.old_edges[old]]
+        s = state[old]
+        free_edges: list[tuple[str, int]] = s["unretrieved_edges"]  # type: ignore[assignment]
+        remaining = int(s["remaining"])
+        free_capacity = int(s["free_capacity"])
+        if len(free_edges) < 2:
+            continue
+        if remaining <= 0 or remaining >= free_capacity:
+            # 边界旧区：每条未查边分别被压成 0 或顶到容量，无需调档
+            continue
+        members = [index[ncode] for ncode, _ in free_edges if ncode not in registered]
         for a in members:
             for b in members:
                 if a != b:
-                    masks[a] |= 1 << b
-    registered_mask = 0
-    for ncode in registered:
-        registered_mask |= 1 << index[ncode]
-    # 已查新区不再属于「未查集合」，其所有冲突边一律屏蔽
-    return [m & ~registered_mask for m in masks]
+                    adj[a] |= 1 << b
+    return adj
 
 
 def min_cost_plan(
-    data: PeriodData, registered: dict[str, dict[str, int]]
+    data: PeriodData,
+    registered: dict[str, dict[str, int]],
+    state: dict[str, dict[str, object]] | None = None,
 ) -> tuple[list[str], int]:
     """求费用最低的待调名单。
 
-    等价于在冲突图上求最小权顶点覆盖，即补集为最大权独立集。
-    新区数 k <= 18，用位掩码 DP 求最大权独立集（O(2^k) 整数运算），
-    tie-break：覆盖费用低 -> 待调个数少 -> 名单编码字典序小。
+    在内部旧区冲突图上求最小权顶点覆盖（补集为最大权独立集）。新区数
+    k <= 18，位掩码 DP 求最大权独立集，复杂度 O(2^k) 整数运算，不逐栋枚举、
+    不遍历查回数。
+
+    tie-break（对顶点覆盖，即待调名单）：
+      1. 总费用低；
+      2. 待调个数少（等价于独立集个数多）；
+      3. 按编码排序后名单字典序靠前（等价于独立集字典序靠后）。
+    候选新区统一按编码排序后再编号，使结果与新区建档顺序无关。
     """
-    codes = data.new_codes
-    n = len(codes)
-    index = {code: i for i, code in enumerate(codes)}
-    registered_idx = {index[c] for c in registered}
-    candidates = [i for i in range(n) if i not in registered_idx]
+    if state is None:
+        state = _old_state(data, registered)
+    raw_adj = _interior_conflict_adj(data, state, registered)
+    code_index = {code: i for i, code in enumerate(data.new_codes)}
+
+    # 按编码排序确定规范位序，消除建档顺序对 tie-break 的影响
+    candidates = sorted(n for n in data.new_codes if n not in registered)
     k = len(candidates)
     if k == 0:
         return [], 0
 
-    candidate_mask = sum(1 << i for i in candidates)
-    raw_masks = _conflict_masks(data, registered)
-    # 压缩到候选编号空间（位 j 对应 candidates[j]）
     adj = [0] * k
-    for j, i in enumerate(candidates):
-        for h, i2 in enumerate(candidates):
-            if raw_masks[i] & (1 << i2):
+    for j, code in enumerate(candidates):
+        m = raw_adj[code_index[code]]
+        for h, other in enumerate(candidates):
+            if m & (1 << code_index[other]):
                 adj[j] |= 1 << h
-    weights = [data.new_fee[codes[i]] for i in candidates]
-    total_weight = sum(weights)
+    weights = [data.new_fee[code] for code in candidates]
 
-    # dp[mask]：诱导子图 mask 上最大权独立集的权重；parent 记录取法用于还原
     size = 1 << k
-    dp = [0] * size
-    take = [False] * size
+    # dp_weight[mask]：诱导子图 mask 上最优独立集的权重和
+    # dp_size[mask]：同权重下独立集最大个数
+    # dp_set[mask]：同权重/同个数下字典序最大的独立集（位掩码）
+    dp_weight = [0] * size
+    dp_size = [0] * size
+    dp_set = [0] * size
     for mask in range(1, size):
         bit = mask & -mask
         j = bit.bit_length() - 1
-        without = dp[mask ^ bit]
-        with_v = weights[j] + dp[mask & ~(bit | adj[j])]
-        if with_v > without:
-            dp[mask] = with_v
-            take[mask] = True
+        rest = mask ^ bit
+        # 不取 j
+        w0, s0, set0 = dp_weight[rest], dp_size[rest], dp_set[rest]
+        # 取 j：连同 j 的邻居一并移出
+        sub = mask & ~(bit | adj[j])
+        w1 = weights[j] + dp_weight[sub]
+        s1 = dp_size[sub] + 1
+        set1 = dp_set[sub] | bit
+        if w1 > w0 or (w1 == w0 and (s1 > s0 or (s1 == s0 and set1 > set0))):
+            dp_weight[mask], dp_size[mask], dp_set[mask] = w1, s1, set1
         else:
-            dp[mask] = without
+            dp_weight[mask], dp_size[mask], dp_set[mask] = w0, s0, set0
 
-    # 还原最大权独立集（优先取权重更大的节点；等权时 DP 顺序天然稳定）
-    independent_local: list[int] = []
-    mask = size - 1
-    while mask:
-        bit = mask & -mask
-        j = bit.bit_length() - 1
-        if take[mask]:
-            independent_local.append(j)
-            mask &= ~(bit | adj[j])
-        else:
-            mask ^= bit
-    independent_set = set(independent_local)
-    cover = [
-        codes[candidates[j]] for j in range(k) if j not in independent_set
-    ]
-    cover_fee = total_weight - dp[size - 1]
-    return cover, cover_fee
+    independent = dp_set[size - 1]
+    cover_mask = (size - 1) ^ independent
+    plan = [candidates[j] for j in range(k) if cover_mask & (1 << j)]
+    total_fee = sum(weights) - dp_weight[size - 1]
+    return plan, total_fee
 
 
 def evaluate(
@@ -421,30 +455,48 @@ def evaluate(
     # 先算各旧区状态，再在其上做相容性判断；不可行时状态仍可供排障展示
     state = _old_state(data, data.registered)
     _check_feasible(data, data.registered)
-    plan, total_fee = min_cost_plan(data, data.registered)
 
-    # 唯一性：每个旧区至多 1 条未查边（可行前提下即可唯一确定全部 x）
-    determined = all(len(s["unretrieved_edges"]) <= 1 for s in state.values())
+    # 唯一确定：不存在内部旧区（未查边 >= 2 且 0 < 余数 < 未查容量）
+    determined = all(
+        len(s["unretrieved_edges"]) <= 1
+        or int(s["remaining"]) <= 0
+        or int(s["remaining"]) >= int(s["free_capacity"])
+        for s in state.values()
+    )
     if determined:
-        status = "completed"
-    else:
-        status = "retrieval_required"
-    return status, state, dict(data.registered), plan, total_fee
+        # 各新区完工数已能唯一确定：空名单、零费用，不再让年报人员花钱调档
+        return "completed", state, dict(data.registered), [], 0
+
+    plan, total_fee = min_cost_plan(data, data.registered, state)
+    return "retrieval_required", state, dict(data.registered), plan, total_fee
 
 
 def solve_completed(
     data: PeriodData, state: dict[str, dict[str, object]]
 ) -> list[tuple[str, str, int]]:
-    """唯一核算各新区完工数：已查边取查回数，唯一未查边取旧区余数。"""
+    """唯一核算各新区完工数。
+
+    已查边取查回数；未查边按旧区状态唯一压定：
+    - 余数为 0：所有未查边取 0；
+    - 余数等于未查容量：每条未查边取其楼栋总数（全部完工）；
+    - 仅一条未查边：取旧区完工余数。
+    """
     values: dict[tuple[str, str], int] = {}
     for ncode, reg in data.registered.items():
         for old_code, v in reg.items():
             values[(ncode, old_code)] = v
     for old, s in state.items():
         edges: list[tuple[str, int]] = s["unretrieved_edges"]  # type: ignore[assignment]
+        remaining = int(s["remaining"])
         if len(edges) == 1:
-            values[(edges[0][0], old)] = int(s["remaining"])
-        # len == 0 时余数必须为 0（可行性已保证），无未知边
+            values[(edges[0][0], old)] = remaining
+        elif remaining == 0:
+            for ncode, _t in edges:
+                values[(ncode, old)] = 0
+        elif remaining == int(s["free_capacity"]):
+            for ncode, t in edges:
+                values[(ncode, old)] = t
+        # 可行性 + completed 状态保证不会出现其他情形
     result = []
     for ncode in data.new_codes:
         total = sum(v for (n, _), v in values.items() if n == ncode)
